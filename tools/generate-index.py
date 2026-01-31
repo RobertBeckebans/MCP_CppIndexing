@@ -22,14 +22,17 @@ import os
 import sys
 import shutil
 import argparse
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 
 class ClangdIndexGenerator:
     def __init__(self, build_directory: str, clangd_path: str = "clangd",
-                 refresh_index: bool = False, log_file: str = None, verbose: bool = False):
+                 refresh_index: bool = False, log_file: str = None, verbose: bool = False,
+                 xml_dir: Optional[str] = None):
         self.build_directory = Path(build_directory).resolve()
+        self.xml_dir = Path(xml_dir).resolve() if xml_dir else None
         self.clangd_path = clangd_path
         self.refresh_index = refresh_index
         self.log_file = log_file
@@ -45,6 +48,7 @@ class ClangdIndexGenerator:
         # Files from compile_commands.json for reporting (now stores full paths)
         self.compile_commands_files = set()  # Set of Path objects
         self.compile_commands_files_by_name = set()  # Set of filenames for backward compatibility
+        self.file_list_source = "compile_commands"
         self.failed_files = set()  # Files that failed to index
         self.files_with_errors = {}  # filename -> error count
         self.indexing_complete = False
@@ -115,17 +119,17 @@ class ClangdIndexGenerator:
             # Normalize the path from clangd to absolute path
             resolved_path = Path(file_path_str).resolve()
             filename = resolved_path.name
-            
+
             # Check if this resolved path is in our compile_commands.json
             if resolved_path in self.compile_commands_files:
                 if resolved_path not in self.processed_compile_files:
                     self.processed_compile_files.add(resolved_path)
                     self.current_processing_file = filename
                     self.last_indexing_activity = time.time()
-                    
+
                     if activity and self.verbose:
                         self._print_verbose(f"📝 Processing {filename}: {activity}")
-                    
+
                     return True
         except Exception:
             pass
@@ -135,15 +139,15 @@ class ClangdIndexGenerator:
         """Display clean progress indicator"""
         if not self.compile_commands_files:
             return
-        
+
         processed_count = len(self.processed_compile_files)
         total_count = len(self.compile_commands_files)
         percentage = (processed_count / total_count) * 100 if total_count > 0 else 0
-        
+
         progress_msg = f"Processing: {processed_count}/{total_count} files ({percentage:.1f}%)"
         if self.current_processing_file:
             progress_msg += f" [{self.current_processing_file}]"
-        
+
         if update_in_place and not self.verbose:
             print(f"\r{progress_msg}", end='', flush=True)
         else:
@@ -190,9 +194,13 @@ class ClangdIndexGenerator:
     def start_clangd(self):
         """Start clangd with the same arguments VS Code uses"""
         compile_commands = self.build_directory / "compile_commands.json"
-        if not compile_commands.exists():
-            raise FileNotFoundError(
-                f"No compile_commands.json found in {self.build_directory}")
+        has_compile_commands = compile_commands.exists()
+        if not has_compile_commands:
+            print(f"⚠️  No compile_commands.json found in {self.build_directory}")
+            if self.file_list_source == "doxygen_xml":
+                print("   Using Doxygen XML file list; clangd will use fallback flags.")
+            else:
+                print("   clangd will use fallback flags.")
 
         # Use same arguments as VS Code (from the log analysis)
         args = [
@@ -202,9 +210,11 @@ class ClangdIndexGenerator:
             "--completion-style=detailed",
             "--log=verbose",  # To see indexing messages
             "--query-driver=**",  # Allow querying all drivers for cross-compilation
-            # Pass build directory to clangd
-            f"--compile-commands-dir={self.build_directory}"
         ]
+
+        if has_compile_commands:
+            # Pass build directory to clangd
+            args.append(f"--compile-commands-dir={self.build_directory}")
 
         print(f"Starting clangd with args: {' '.join(args)}")
         print(f"Working directory: {os.getcwd()}")
@@ -217,6 +227,8 @@ class ClangdIndexGenerator:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=0
         )
 
@@ -253,13 +265,13 @@ class ClangdIndexGenerator:
                         "Broadcasting", "ASTWorker", "Error", "Failed",
                         "error:", "warning:", "fatal error"
                     ])
-                    
+
                     if show_clangd_log:
                         self._print_verbose(f"[CLANGD LOG] {line}")
 
                     # Track file processing from multiple log patterns
                     file_processed = False
-                    
+
                     if "Indexed " in line and "symbols" in line:
                         # Extract filename from log line like:
                         # "Indexed /path/to/file.cpp (1234 symbols, ...)"
@@ -267,7 +279,7 @@ class ClangdIndexGenerator:
                             file_part = line.split("Indexed ")[1].split(" (")[0]
                             filename = Path(file_part).name
                             self.indexed_files.add(filename)
-                            
+
                             # Mark as processed if it's from compile_commands.json
                             if self._mark_file_as_processed(file_part, "indexed with symbols"):
                                 file_processed = True
@@ -277,7 +289,7 @@ class ClangdIndexGenerator:
 
                         except Exception:
                             pass  # Ignore parsing errors
-                    
+
                     elif "Building first preamble for " in line:
                         # Extract filename from preamble build message
                         # Format: "Building first preamble for /path/to/file.cpp version N"
@@ -288,7 +300,7 @@ class ClangdIndexGenerator:
                                 file_processed = True
                         except Exception:
                             pass
-                    
+
                     elif "ASTWorker building file " in line:
                         # Extract filename from ASTWorker build messages
                         # Format: "ASTWorker building file /path/to/file.cpp version N with command ..."
@@ -299,7 +311,7 @@ class ClangdIndexGenerator:
                                 file_processed = True
                         except Exception:
                             pass
-                    
+
                     # Update progress display if a compile_commands.json file was processed
                     if file_processed and not self.verbose:
                         self._print_progress(update_in_place=True)
@@ -499,6 +511,11 @@ class ClangdIndexGenerator:
 
         json_text = json.dumps(message)
         content = f"Content-Length: {len(json_text)}\r\n\r\n{json_text}"
+
+        if not self.process or self.process.poll() is not None or self.process.stdin is None:
+            if self.verbose:
+                print("⚠️  clangd is not running; skipping LSP write")
+            return
 
         with self.stdin_lock:
             try:
@@ -708,44 +725,59 @@ class ClangdIndexGenerator:
         The key insight: VS Code triggers indexing by opening a file!
         This is what actually starts the background indexing process.
         """
-        # Get the first file from compile_commands.json - no need for folder introspection
+        # Get a file to trigger indexing (compile_commands.json preferred, otherwise Doxygen XML list)
         compile_commands = self.build_directory / "compile_commands.json"
 
         try:
-            with open(compile_commands, 'r') as f:
-                commands = json.load(f)
+            cpp_file = None
 
-            if not commands:
-                print("⚠️  No files in compile_commands.json. Cannot trigger indexing.")
+            if compile_commands.exists():
+                with open(compile_commands, 'r') as f:
+                    commands = json.load(f)
+
+                if not commands:
+                    print("⚠️  No files in compile_commands.json. Cannot trigger indexing.")
+                    return
+
+                # Use the first file from compile_commands.json and resolve it properly
+                cmd = commands[0]
+                directory = Path(cmd.get('directory', '.')).resolve()
+                cpp_file = Path(cmd['file'])
+                if not cpp_file.is_absolute():
+                    cpp_file = (directory / cpp_file).resolve()
+                else:
+                    cpp_file = cpp_file.resolve()
+            elif self.compile_commands_files:
+                for candidate in sorted(self.compile_commands_files):
+                    if candidate.exists() and candidate.is_file():
+                        cpp_file = candidate
+                        break
+                if not cpp_file:
+                    print("⚠️  No files available to trigger indexing.")
+                    return
+            else:
+                print("⚠️  No files available to trigger indexing.")
                 return
 
-            # Use the first file from compile_commands.json and resolve it properly
-            cmd = commands[0]
-            directory = Path(cmd.get('directory', '.')).resolve()
-            cpp_file = Path(cmd['file'])
-            if not cpp_file.is_absolute():
-                cpp_file = (directory / cpp_file).resolve()
-            else:
-                cpp_file = cpp_file.resolve()
-            
             # Check if the file exists before trying to open it
             if not cpp_file.exists():
-                print(f"❌ Error: First file from compile_commands.json does not exist: {cpp_file}")
+                print(f"❌ Error: Selected file does not exist: {cpp_file}")
                 print("   Cannot trigger indexing without a valid source file.")
                 return
-            
+
             print(f"📂 Opening file to trigger indexing: {cpp_file}")
 
             with open(cpp_file, 'r', encoding='utf-8') as f:
                 content = f.read()
         except Exception as e:
-            print(f"❌ Could not read file from compile_commands.json: {e}")
+            print(f"❌ Could not read file to trigger indexing: {e}")
             return
 
         # Send textDocument/didOpen - this is the trigger!
+        cpp_file_uri = cpp_file.as_uri()
         did_open_params = {
             "textDocument": {
-                "uri": f"file://{cpp_file}",
+                "uri": cpp_file_uri,
                 "languageId": "cpp",
                 "version": 1,
                 "text": content
@@ -758,7 +790,7 @@ class ClangdIndexGenerator:
         # Also send some requests that VS Code typically sends
         time.sleep(0.1)
 
-        doc_uri = {"uri": f"file://{cpp_file}"}
+        doc_uri = {"uri": cpp_file_uri}
 
         # Request document symbols (this works with clangd)
         self._send_request("textDocument/documentSymbol",
@@ -776,9 +808,10 @@ class ClangdIndexGenerator:
             return False
 
         # Send textDocument/didOpen
+        file_uri = file_path.as_uri()
         did_open_params = {
             "textDocument": {
-                "uri": f"file://{file_path}",
+                "uri": file_uri,
                 "languageId": "cpp",
                 "version": 1,
                 "text": content
@@ -798,29 +831,31 @@ class ClangdIndexGenerator:
         for file_path in self.compile_commands_files:
             if file_path not in self.processed_compile_files:
                 unprocessed_files.append(file_path)
-        
+
         if not unprocessed_files:
             print(f"✅ All {len(self.compile_commands_files)} files have already been processed!")
             return True
-        
+
         # Clear any lingering progress display before starting sequential processing
         if not self.verbose:
             print()  # Clear the progress line completely
-        
+
         print(f"📂 Opening {len(unprocessed_files)} remaining files one at a time to ensure complete indexing...")
-        
+
         files_opened = 0
         max_wait_per_file = 15  # 15 seconds timeout per file
-        
+        if self.file_list_source == "doxygen_xml":
+            max_wait_per_file = 5  # Doxygen XML list can be large; keep per-file wait short
+
         for file_path in sorted(unprocessed_files):
             files_opened += 1
             progress = f"({files_opened}/{len(unprocessed_files)})"
-            
+
             if self.verbose:
                 print(f"   {progress} Opening {file_path.name} and waiting for processing...")
             else:
                 print(f"   {progress} Opening {file_path.name}...", end='', flush=True)
-            
+
             # Open the file
             if not self.open_file_for_indexing(file_path):
                 if not self.verbose:
@@ -828,14 +863,14 @@ class ClangdIndexGenerator:
                 else:
                     print(f"   ❌ Failed to open {file_path.name}")
                 continue
-            
+
             # Wait for this specific file to be processed
             wait_start = time.time()
             file_processed = False
-            
+
             while time.time() - wait_start < max_wait_per_file:
                 time.sleep(0.3)
-                
+
                 # Check if this file has been processed
                 if file_path in self.processed_compile_files:
                     file_processed = True
@@ -844,36 +879,36 @@ class ClangdIndexGenerator:
                     else:
                         print(f"   ✅ {file_path.name} processed successfully")
                     break
-                
+
                 # Check for ongoing activity - extend timeout if there's activity
                 if time.time() - self.last_indexing_activity < 2:
                     # Reset timeout if there's recent activity
                     wait_start = time.time()
                     if not self.verbose:
                         print(".", end='', flush=True)  # Show activity dots
-            
+
             if not file_processed:
                 if not self.verbose:
                     print(" ⏰ timeout")
                 else:
                     print(f"   ⏰ Timeout waiting for {file_path.name} to be processed")
-        
+
         # Final status check
         final_processed = len(self.processed_compile_files)
         total_count = len(self.compile_commands_files)
-        
+
         if final_processed == total_count:
             print(f"✅ All {total_count} files have been processed by clangd!")
             return True
         else:
             remaining = total_count - final_processed
             print(f"⚠️  {remaining} files could not be processed:")
-            
+
             unprocessed = []
             for file_path in self.compile_commands_files:
                 if file_path not in self.processed_compile_files:
                     unprocessed.append(file_path.name)
-            
+
             if self.verbose or len(unprocessed) <= 10:
                 for filename in sorted(unprocessed):
                     print(f"   - {filename}")
@@ -881,7 +916,7 @@ class ClangdIndexGenerator:
                 for filename in sorted(unprocessed[:5]):
                     print(f"   - {filename}")
                 print(f"   ... and {len(unprocessed) - 5} more (use --verbose for full list)")
-            
+
             return False
 
     def wait_for_indexing_completion(self):
@@ -919,7 +954,7 @@ class ClangdIndexGenerator:
         # Clear any in-place progress display before final messages
         if not self.verbose:
             print()  # Ensure clean line after progress updates
-        
+
         # Determine completion status
         if self.indexing_complete:
             print("✅ Initial indexing completed successfully!")
@@ -927,10 +962,16 @@ class ClangdIndexGenerator:
             print("\n🔍 Checking compile commands coverage...")
             if not self.ensure_all_files_indexed():
                 print("⚠️  Not all files could be indexed completely")
-        elif self.process and self.process.poll() is not None:
-            print("⚠️  clangd process ended")
         else:
-            print("🔄 Indexing monitoring stopped")
+            if self.process and self.process.poll() is not None:
+                print("⚠️  clangd process ended")
+            else:
+                print("🔄 Indexing monitoring stopped")
+
+            if self.compile_commands_files:
+                print("\n🔍 Ensuring files are opened for indexing...")
+                if not self.ensure_all_files_indexed():
+                    print("⚠️  Not all files could be indexed completely")
 
         # Final summary with detailed analysis
         if self.compile_commands_files:
@@ -938,7 +979,7 @@ class ClangdIndexGenerator:
             total_compile = len(self.compile_commands_files)
             final_percentage = (processed_from_compile /
                                 total_compile) * 100 if total_compile > 0 else 0
-            
+
             print(f"\n📊 FINAL SUMMARY")
             print("=" * 40)
             print(f"📋 Files in compile_commands.json: {total_compile}")
@@ -951,7 +992,7 @@ class ClangdIndexGenerator:
                 for file_path in self.compile_commands_files:
                     if file_path not in self.processed_compile_files:
                         missing_files.add(file_path.name)
-                
+
                 print(f"❓ Files not processed: {len(missing_files)}")
                 if self.verbose or len(missing_files) <= 5:
                     for filename in sorted(missing_files):
@@ -979,9 +1020,9 @@ class ClangdIndexGenerator:
             print("   - clangd used cached index data")
 
         # Report indexing failures and issues only if there are errors or in verbose mode
-        has_issues = (self.files_with_errors or self.diagnostic_errors > 0 or 
+        has_issues = (self.files_with_errors or self.diagnostic_errors > 0 or
                      self.diagnostic_warnings > 0 or self.lsp_errors > 0)
-        
+
         if has_issues or self.verbose:
             print("\n📊 INDEXING ISSUES SUMMARY")
             print("=" * 40)
@@ -1057,17 +1098,30 @@ class ClangdIndexGenerator:
         """Load files from compile_commands.json for information and reporting"""
         compile_commands = self.build_directory / "compile_commands.json"
         if not compile_commands.exists():
-            raise FileNotFoundError(
-                f"No compile_commands.json found in {self.build_directory}")
+            if self.xml_dir and self.xml_dir.exists():
+                print(f"⚠️  No compile_commands.json found in {self.build_directory}")
+                print(f"🔁 Falling back to Doxygen XML file list: {self.xml_dir}")
+                self.load_doxygen_xml_info(self.xml_dir)
+                self.generate_fake_compile_commands(
+                    self.build_directory / "compile_commands.json")
+                return
+            print(f"⚠️  No compile_commands.json found in {self.build_directory}")
+            print("🔁 No Doxygen XML available. Falling back to directory scan.")
+            self.scan_source_files_in_directory(self.build_directory)
+            self.generate_fake_compile_commands(
+                self.build_directory / "compile_commands.json")
+            return
 
         try:
             with open(compile_commands, 'r') as f:
                 commands = json.load(f)
 
+            self.file_list_source = "compile_commands"
+
             # Track seen files to avoid duplicates - use the first occurrence
             seen_files = set()
             missing_files = []
-            
+
             for cmd in commands:
                 if 'file' in cmd:
                     # Resolve relative paths using the directory field
@@ -1077,11 +1131,11 @@ class ClangdIndexGenerator:
                         file_path = (directory / file_path).resolve()
                     else:
                         file_path = file_path.resolve()
-                    
+
                     # Only add if we haven't seen this absolute path before (first occurrence wins)
                     if file_path not in seen_files:
                         seen_files.add(file_path)
-                        
+
                         # Check if file exists
                         if file_path.exists():
                             self.compile_commands_files.add(file_path)  # Store resolved absolute Path object
@@ -1095,7 +1149,7 @@ class ClangdIndexGenerator:
                 print(f"   Files: {', '.join(sorted(self.compile_commands_files_by_name))}")
             else:
                 print(f"   Use --verbose to see file list")
-            
+
             # Warn about missing files
             if missing_files:
                 print(f"⚠️  Warning: {len(missing_files)} files from compile_commands.json do not exist:")
@@ -1111,11 +1165,126 @@ class ClangdIndexGenerator:
             print(f"❌ Error reading compile_commands.json: {e}")
             raise
 
+    def generate_fake_compile_commands(self, output_path: Path):
+        """Generate a minimal compile_commands.json from the current file list"""
+        if not self.compile_commands_files:
+            print("⚠️  No files available to generate fake compile_commands.json")
+            return
+
+        entries = []
+        project_root = self.build_directory
+        for file_path in sorted(self.compile_commands_files):
+            compiler = "clang" if file_path.suffix.lower() == ".c" else "clang++"
+            command = f'{compiler} -std=c++20 -c "{file_path}"'
+            entries.append({
+                "directory": str(project_root),
+                "file": str(file_path),
+                "command": command
+            })
+
+        try:
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(entries, f, indent=2)
+            print(f"🧩 Wrote fake compile_commands.json to {output_path}")
+        except Exception as e:
+            print(f"⚠️  Failed to write fake compile_commands.json: {e}")
+
+    def scan_source_files_in_directory(self, root_dir: Path):
+        """Scan directory for .h, .c, .cpp files when XML yields nothing"""
+        if not root_dir.exists():
+            print(f"⚠️  Scan directory does not exist: {root_dir}")
+            return
+
+        exts = {".h", ".c", ".cpp"}
+        found = 0
+
+        for file_path in root_dir.rglob("*"):
+            if not file_path.is_file():
+                continue
+            if file_path.suffix.lower() not in exts:
+                continue
+            if file_path in self.compile_commands_files:
+                continue
+
+            self.compile_commands_files.add(file_path)
+            self.compile_commands_files_by_name.add(file_path.name)
+            found += 1
+
+        self.file_list_source = "directory_scan"
+        print(f"📋 Found {found} files by directory scan in {root_dir}")
+        if self.verbose and self.compile_commands_files_by_name:
+            print(f"   Files: {', '.join(sorted(self.compile_commands_files_by_name))}")
+        elif found > 0:
+            print("   Use --verbose to see file list")
+        else:
+            print("   No .h/.c/.cpp files found")
+
+    def load_doxygen_xml_info(self, xml_dir: Path):
+        """Load files from Doxygen XML output for information and reporting"""
+        if not xml_dir.exists():
+            raise FileNotFoundError(f"No Doxygen XML directory found at {xml_dir}")
+
+        seen_files = set()
+        missing_files = []
+
+        for xf in xml_dir.glob("*.xml"):
+            try:
+                root = ET.parse(xf).getroot()
+            except Exception:
+                continue
+
+            for loc in root.findall(".//location"):
+                for attr in ("file", "bodyfile"):
+                    path_str = loc.get(attr)
+                    if not path_str:
+                        continue
+
+                    file_path = Path(path_str)
+                    if not file_path.is_absolute():
+                        file_path = (Path.cwd() / file_path).resolve()
+                    else:
+                        file_path = file_path.resolve()
+
+                    if file_path in seen_files:
+                        continue
+                    seen_files.add(file_path)
+
+                    if file_path.exists() and file_path.is_file():
+                        self.compile_commands_files.add(file_path)
+                        self.compile_commands_files_by_name.add(file_path.name)
+                    elif not file_path.exists():
+                        missing_files.append(file_path)
+
+        self.file_list_source = "doxygen_xml"
+        total_files = len(self.compile_commands_files)
+        print(f"📋 Found {total_files} files in Doxygen XML")
+        if self.verbose:
+            print(f"   Files: {', '.join(sorted(self.compile_commands_files_by_name))}")
+        else:
+            print("   Use --verbose to see file list")
+
+        if total_files == 0:
+            print("⚠️  No files found in Doxygen XML. Falling back to directory scan.")
+            self.scan_source_files_in_directory(self.build_directory)
+            return
+
+        if missing_files:
+            print(f"⚠️  Warning: {len(missing_files)} files from Doxygen XML do not exist:")
+            if self.verbose or len(missing_files) <= 5:
+                for missing_file in missing_files:
+                    print(f"   - {missing_file}")
+            else:
+                for missing_file in missing_files[:3]:
+                    print(f"   - {missing_file}")
+                print(f"   ... and {len(missing_files) - 3} more (use --verbose for full list)")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Generate clangd index")
     parser.add_argument("build_directory",
                         help="Build directory with compile_commands.json")
+    parser.add_argument("--xml-dir", default="doxygen-xml/xml",
+                        help="Fallback Doxygen XML directory for file discovery")
     parser.add_argument("--refresh-index", action="store_true",
                         help="Clean cache before indexing")
     parser.add_argument("--clangd-path", default="clangd",
@@ -1160,6 +1329,15 @@ def main():
         print("  3. Install clangd at /usr/bin/clangd")
         sys.exit(1)
 
+    # Normalize clangd path for directories or missing .exe on Windows
+    if clangd_path:
+        if Path(clangd_path).is_dir():
+            clangd_path = str(Path(clangd_path) / "clangd")
+        if os.name == "nt" and Path(clangd_path).suffix.lower() != ".exe":
+            candidate = f"{clangd_path}.exe"
+            if Path(candidate).exists():
+                clangd_path = candidate
+
     # Verify the clangd path works
     try:
         subprocess.run([clangd_path, "--version"],
@@ -1169,7 +1347,8 @@ def main():
         sys.exit(1)
 
     generator = ClangdIndexGenerator(
-        args.build_directory, clangd_path, args.refresh_index, args.log_file, args.verbose)
+        args.build_directory, clangd_path, args.refresh_index, args.log_file, args.verbose,
+        xml_dir=args.xml_dir)
 
     try:
         print("=" * 60)
