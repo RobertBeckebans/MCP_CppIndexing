@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rust_mcp_sdk::schema::{
-    CallToolRequest, CallToolResult, ListToolsRequest, ListToolsResult, RpcError,
+    CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams, RpcError,
     schema_utils::CallToolError,
 };
 use rust_mcp_sdk::{McpServer, mcp_server::ServerHandler};
@@ -120,7 +120,7 @@ register_tools! {
 impl ServerHandler for CppServerHandler {
     async fn handle_list_tools_request(
         &self,
-        request: ListToolsRequest,
+        request: Option<PaginatedRequestParams>,
         _runtime: Arc<dyn McpServer>,
     ) -> std::result::Result<ListToolsResult, RpcError> {
         let start = Instant::now();
@@ -142,19 +142,17 @@ impl ServerHandler for CppServerHandler {
 
     async fn handle_call_tool_request(
         &self,
-        request: CallToolRequest,
+        request: CallToolRequestParams,
         _runtime: Arc<dyn McpServer>,
     ) -> std::result::Result<CallToolResult, CallToolError> {
         let start = Instant::now();
-        let tool_name = request.params.name.clone();
+        let tool_name = request.name.clone();
 
         log_mcp_message!(Level::INFO, "incoming", "call_tool", &request);
         info!("Executing tool: {}", tool_name);
 
         // Generated dispatch with compile-time safety
-        let result = self
-            .dispatch_tool(&tool_name, request.params.arguments)
-            .await?;
+        let result = self.dispatch_tool(&tool_name, request.arguments).await?;
 
         log_mcp_message!(Level::INFO, "outgoing", "call_tool", &result);
         log_timing!(

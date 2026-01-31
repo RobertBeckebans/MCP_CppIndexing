@@ -14,12 +14,12 @@ use logging::{LogConfig, init_logging};
 use mcp_server::CppServerHandler;
 use project::{ProjectScanner, ProjectWorkspace};
 use rust_mcp_sdk::schema::{
-    Implementation, InitializeResult, LATEST_PROTOCOL_VERSION, ServerCapabilities,
-    ServerCapabilitiesTools,
+    Implementation, InitializeResult, ProtocolVersion, ServerCapabilities, ServerCapabilitiesTools,
 };
 
 use rust_mcp_sdk::{
-    McpServer, StdioTransport, TransportOptions, error::SdkResult, mcp_server::server_runtime,
+    McpServer, StdioTransport, ToMcpServerHandler, TransportOptions, error::SdkResult, mcp_icon,
+    mcp_server::{server_runtime, McpServerOptions},
 };
 use std::path::PathBuf;
 use tracing::info;
@@ -125,6 +125,16 @@ async fn main() -> SdkResult<()> {
             name: "C++ MCP Server".to_string(),
             version: "0.1.0".to_string(),
             title: Some("C++ Project Analysis MCP Server".to_string()),
+            description: Some("C++ project analysis and LSP bridge server".to_string()),
+            icons: vec![
+                mcp_icon!(
+                    src = "https://raw.githubusercontent.com/rust-mcp-stack/rust-mcp-sdk/main/assets/rust-mcp-icon.png",
+                    mime_type = "image/png",
+                    sizes = ["128x128"],
+                    theme = "dark"
+                )
+            ],
+            website_url: Some("https://github.com/rust-mcp-stack/rust-mcp-sdk".to_string()),
         },
         capabilities: ServerCapabilities {
             tools: Some(ServerCapabilitiesTools { list_changed: None }),
@@ -132,7 +142,7 @@ async fn main() -> SdkResult<()> {
         },
         meta: None,
         instructions: Some("C++ project analysis and LSP bridge server".to_string()),
-        protocol_version: LATEST_PROTOCOL_VERSION.to_string(),
+        protocol_version: ProtocolVersion::V2025_11_25.into(),
     };
 
     // Resolve clangd path
@@ -152,7 +162,13 @@ async fn main() -> SdkResult<()> {
     };
 
     // Create MCP server
-    let server = server_runtime::create_server(server_details, transport, handler);
+    let server = server_runtime::create_server(McpServerOptions {
+        server_details,
+        transport,
+        handler: handler.to_mcp_server_handler(),
+        task_store: None,
+        client_task_store: None,
+    });
 
     info!("C++ MCP Server ready and listening for requests");
 
